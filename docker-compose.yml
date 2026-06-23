@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    container_name: mgcom_nb_bot
+    env_file: .env
+    environment:
+      - TZ=Europe/Moscow
+    ports:
+      # Порт приёма снапшотов от Apps Script (POST /ingest).
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
