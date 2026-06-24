@@ -59,20 +59,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = _user_by_username(cfg, tg_user.username if tg_user else None)
 
     if user is None:
-        await update.message.reply_text(
-            "Извините, у вас нет доступа к этому боту. "
-            "Обратитесь к администратору."
-        )
+        await update.message.reply_text("Доступ ограничен.")
         logger.info("Отказ в доступе: username=%s", tg_user.username if tg_user else None)
         return
 
     store.set(user.login, update.effective_chat.id)
     logger.info("Подписан %s (setter=%s, chat_id=%s)", user.login, user.setter, update.effective_chat.id)
 
+    name = user.greeting or user.setter
     await update.message.reply_text(
-        "Готово! Вы подписаны на ежедневную сводку просроченных сделок "
-        f"в {cfg.send_hour:02d}:{cfg.send_minute:02d} по Москве.\n"
-        "Команда /deals — показать актуальные сделки прямо сейчас."
+        f"{name}, привет! 👋\n\n"
+        "Я слежу за твоими просроченными сделками из таблицы и напоминаю о них.\n\n"
+        f"Каждый день в {cfg.send_hour:02d}:{cfg.send_minute:02d} по Москве я буду "
+        "присылать список сделок, где ты указан постановщиком, а дедлайн (ДЛ) уже прошёл. "
+        "Под сообщением есть кнопка «🔄 Обновить» — она в любой момент покажет "
+        "актуальные данные.\n\n"
+        f"Я узнал тебя как постановщика: {user.setter}.\n"
+        "Команда /deals — показать просроченные сделки прямо сейчас."
     )
 
 
