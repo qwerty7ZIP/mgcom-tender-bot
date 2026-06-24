@@ -1,18 +1,19 @@
-"""Telegram-бот: рассылка просроченных сделок менеджерам в 11:00 МСК + кнопка «Обновить»."""
+"""Telegram-бот: рассылка просроченных сделок менеджерам в 11:00 МСК + кнопка «Мои просроченные»."""
 from __future__ import annotations
 
 import logging
 from datetime import time
 from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from config import Config, User, load_config
@@ -26,12 +27,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mgcom_nb_bot")
 
-REFRESH_CALLBACK = "refresh"
+BUTTON_TEXT = "Мои просроченные"
 
 
-def _keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔄 Обновить", callback_data=REFRESH_CALLBACK)]]
+def _keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[BUTTON_TEXT]],
+        resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -72,10 +75,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Я слежу за твоими просроченными сделками из таблицы и напоминаю о них.\n\n"
         f"Каждый день в {cfg.send_hour:02d}:{cfg.send_minute:02d} по Москве я буду "
         "присылать список сделок, где ты указан постановщиком, а дедлайн (ДЛ) уже прошёл. "
-        "Под сообщением есть кнопка «🔄 Обновить» — она в любой момент покажет "
+        "А кнопка «Мои просроченные» под полем ввода в любой момент покажет "
         "актуальные данные.\n\n"
-        f"Я узнал тебя как постановщика: {user.setter}.\n"
-        "Команда /deals — показать просроченные сделки прямо сейчас."
+        f"Я узнал тебя как постановщика: {user.setter}.",
+        reply_markup=_keyboard(),
     )
 
 
@@ -86,7 +89,7 @@ async def deals_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg_user = update.effective_user
     user = _user_by_username(cfg, tg_user.username if tg_user else None)
     if user is None:
-        await update.message.reply_text("У вас нет доступа к этому боту.")
+        await update.message.reply_text("Доступ ограничен.")
         return
 
     store.set(user.login, update.effective_chat.id)
@@ -107,41 +110,6 @@ async def deals_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         disable_web_page_preview=True,
         reply_markup=_keyboard(),
     )
-
-
-async def on_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Config = context.application.bot_data["cfg"]
-    query = update.callback_query
-
-    tg_user = update.effective_user
-    user = _user_by_username(cfg, tg_user.username if tg_user else None)
-    if user is None:
-        await query.answer("Нет доступа", show_alert=True)
-        return
-
-    await query.answer("Обновляю…")
-    greeting = _greeting_for(user, tg_user.first_name if tg_user else None)
-    try:
-        text = _render_for_user(cfg, user, greeting)
-    except SnapshotNotReady as exc:
-        await query.answer(str(exc), show_alert=True)
-        return
-    except Exception:
-        logger.exception("Ошибка обновления для %s", user.login)
-        await query.answer("Не удалось загрузить данные", show_alert=True)
-        return
-
-    try:
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=_keyboard(),
-        )
-    except TelegramError as exc:
-        # Telegram кидает ошибку, если текст не изменился — это нормально.
-        if "not modified" not in str(exc).lower():
-            raise
 
 
 async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,7 +166,9 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("deals", deals_now))
-    app.add_handler(CallbackQueryHandler(on_refresh, pattern=f"^{REFRESH_CALLBACK}$"))
+    app.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(f"^{BUTTON_TEXT}$"), deals_now)
+    )
 
     app.job_queue.run_daily(
         send_daily_reports,
