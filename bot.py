@@ -61,7 +61,9 @@ def _manager_keyboard() -> ReplyKeyboardMarkup:
 
 
 def _admin_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([[BUTTON_ADMIN]], resize_keyboard=True, is_persistent=True)
+    return ReplyKeyboardMarkup(
+        [[BUTTON_ADMIN, BUTTON_DECISION]], resize_keyboard=True, is_persistent=True
+    )
 
 
 def _head_keyboard() -> ReplyKeyboardMarkup:
@@ -161,9 +163,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{name}, привет! 👋\n\n"
             "Я слежу за просроченными сделками по всем менеджерам.\n\n"
             f"Каждый день в {when} по Москве я пришлю общий список просроченных сделок, "
-            "сгруппированный по менеджерам. Под сообщением будут кнопки по каждому "
-            "менеджеру — нажми, чтобы получить только его сделки. А кнопка "
-            "«Все просроченные» под полем ввода покажет общий список в любой момент.",
+            "сгруппированный по менеджерам, и список сделок на принятие решения. "
+            "Под сообщением будут кнопки по каждому менеджеру — нажми, чтобы получить "
+            "только его сделки. Кнопки под полем ввода:\n"
+            "• «Все просроченные» — общий список просрочки;\n"
+            "• «Принятие решения» — сделки, ожидающие решения.",
             reply_markup=_admin_keyboard(),
         )
     elif user.is_head:
@@ -228,7 +232,7 @@ async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     tg_user = update.effective_user
     user = _user_by_username(cfg, tg_user.username if tg_user else None)
-    if user is None or not user.is_head:
+    if user is None or not (user.is_head or user.is_admin):
         await update.message.reply_text("Доступ ограничен.")
         return
 
