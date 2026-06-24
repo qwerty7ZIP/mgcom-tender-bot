@@ -130,8 +130,28 @@ def _int(name: str, default: int) -> int:
     return int(value) if value else default
 
 
+def _load_users() -> list[User]:
+    """Список пользователей: из USERS_JSON (одна строка) или из файла USERS_FILE.
+
+    Приоритет у USERS_JSON. Если он не задан — читаем JSON-файл (можно с отступами
+    и переносами строк), путь берём из USERS_FILE (по умолчанию users.json).
+    """
+    raw = os.getenv("USERS_JSON", "").strip()
+    if raw:
+        return _parse_users(raw)
+
+    path = os.getenv("USERS_FILE", "users.json").strip() or "users.json"
+    if not os.path.exists(path):
+        raise RuntimeError(
+            "Список пользователей не задан: укажи USERS_JSON в .env "
+            f"или создай файл {path} (см. users.json.example)."
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        return _parse_users(f.read())
+
+
 def load_config() -> Config:
-    users = _parse_users(_require("USERS_JSON"))
+    users = _load_users()
     cfg = Config(
         bot_token=_require("BOT_TOKEN"),
         users=users,

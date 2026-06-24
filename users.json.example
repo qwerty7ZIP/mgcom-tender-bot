@@ -1,0 +1,5 @@
+[
+  {"login": "boss_login",   "greeting": "Шеф",  "role": "admin"},
+  {"login": "head_login",   "setter": "Руководитель Иванов", "greeting": "Шеф", "role": "head"},
+  {"login": "manager_login","setter": "Иван Петров", "greeting": "Вань", "role": "manager"}
+]

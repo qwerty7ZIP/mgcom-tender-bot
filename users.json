@@ -1,0 +1,10 @@
+[
+  {"login": "agapitow",        "setter": "Рыбальченко Евгений",   "greeting": "Создатель", "role": "head"},
+  {"login": "Rocketrollo",     "setter": "Рыбальченко Евгений",   "greeting": "Жень",      "role": "admin"},
+  {"login": "dzhuravell",      "setter": "Журавель Дарья",        "greeting": "Даш",       "role": "manager"},
+  {"login": "KatrinaB28",      "setter": "Балаева Екатерина",     "greeting": "Кать",      "role": "manager"},
+  {"login": "Retyunskikh",     "setter": "Ретюнских Анна",        "greeting": "Ань",       "role": "manager"},
+  {"login": "theTessler",      "setter": "Тесслер Александр",     "greeting": "Саш",       "role": "manager"},
+  {"login": "protonina",       "setter": "Протонина Татьяна",     "greeting": "Тань",      "role": "manager"},
+  {"login": "StanislavJoulev", "setter": "Жулёв Станислав",       "greeting": "Стас",      "role": "manager"}
+]
