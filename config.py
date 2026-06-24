@@ -39,8 +39,8 @@ class Config:
     ingest_port: int = 8080
 
     timezone: str = "Europe/Moscow"
-    send_hour: int = 11
-    send_minute: int = 0
+    # Время(-ена) ежедневной рассылки по timezone, список (час, минута).
+    send_times: tuple[tuple[int, int], ...] = ((11, 0), (17, 0))
 
     # Названия колонок в таблице (можно переопределить через env).
     col_id: str = "ID"
@@ -130,6 +130,21 @@ def _int(name: str, default: int) -> int:
     return int(value) if value else default
 
 
+def _parse_times(raw: str) -> tuple[tuple[int, int], ...]:
+    """SEND_TIMES — времена рассылки через запятую в формате HH:MM (напр. '11:00,17:00')."""
+    times: list[tuple[int, int]] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        hh, _, mm = part.partition(":")
+        hour, minute = int(hh), int(mm or 0)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise RuntimeError(f"SEND_TIMES: некорректное время '{part}'")
+        times.append((hour, minute))
+    return tuple(times) if times else ((11, 0),)
+
+
 def _load_users() -> list[User]:
     """Список пользователей: из USERS_JSON (одна строка) или из файла USERS_FILE.
 
@@ -159,8 +174,7 @@ def load_config() -> Config:
         ingest_host=os.getenv("INGEST_HOST", "0.0.0.0").strip() or "0.0.0.0",
         ingest_port=_int("INGEST_PORT", 8080),
         timezone=os.getenv("TZ", "Europe/Moscow").strip() or "Europe/Moscow",
-        send_hour=_int("SEND_HOUR", 11),
-        send_minute=_int("SEND_MINUTE", 0),
+        send_times=_parse_times(os.getenv("SEND_TIMES", "11:00,17:00")),
         col_id=os.getenv("COL_ID", "ID").strip() or "ID",
         col_name=os.getenv("COL_NAME", "Название").strip() or "Название",
         col_setter=os.getenv("COL_SETTER", "Постановщик").strip() or "Постановщик",

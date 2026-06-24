@@ -78,6 +78,10 @@ def _keyboard_for(user: User) -> ReplyKeyboardMarkup:
     return _manager_keyboard()
 
 
+def _times_str(cfg: Config) -> str:
+    return ", ".join(f"{h:02d}:{m:02d}" for h, m in cfg.send_times)
+
+
 def _managers_inline(cfg: Config) -> InlineKeyboardMarkup | None:
     """Инлайн-кнопки по каждому менеджеру (подпись = setter, callback = индекс)."""
     rows = [
@@ -150,7 +154,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user.login, user.role, user.setter, update.effective_chat.id,
     )
 
-    when = f"{cfg.send_hour:02d}:{cfg.send_minute:02d}"
+    when = _times_str(cfg)
     if user.is_admin:
         name = user.greeting or "коллега"
         await update.message.reply_text(
@@ -289,6 +293,15 @@ async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Не удалось прочитать снапшот таблицы для авторассылки")
         return
 
+    # Лист принятия решения нужен только для head/admin; может быть ещё не получен.
+    df_decision = None
+    try:
+        df_decision = fetch_dataframe(cfg, sheet=cfg.decision_sheet)
+    except SnapshotNotReady:
+        logger.warning("Лист «%s» ещё не получен — пропускаю сообщения принятия решения", cfg.decision_sheet)
+    except Exception:
+        logger.exception("Не удалось прочитать лист принятия решения")
+
     sent = 0
     for user in cfg.users:
         chat_id = store.get(user.login)
@@ -296,26 +309,35 @@ async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.info("Пропуск %s: не нажимал /start", user.login)
             continue
 
+        name = user.greeting or user.setter or "Коллеги"
+        # Собираем сообщения для пользователя: (текст, разметка).
+        messages: list[tuple[str, object]] = []
+
+        # 1) Просроченные сделки.
         if user.is_admin:
             overdue = overdue_all(df, cfg)
-            if overdue.empty and not cfg.send_when_empty:
-                continue
-            text = build_admin_message(user.greeting or "Коллеги", overdue, cfg)
-            reply_markup = _managers_inline(cfg)
+            if not (overdue.empty and not cfg.send_when_empty):
+                messages.append((build_admin_message(name, overdue, cfg), _managers_inline(cfg)))
         else:
             deals = overdue_for_setter(df, user.setter, cfg)
-            if deals.empty and not cfg.send_when_empty:
-                continue
-            text = build_message(user.greeting or "Коллега", deals, cfg)
-            reply_markup = _manager_keyboard()
+            if not (deals.empty and not cfg.send_when_empty):
+                messages.append((build_message(name, deals, cfg), _keyboard_for(user)))
 
-        try:
-            await _send_html(context.bot, chat_id, text, reply_markup=reply_markup)
-            sent += 1
-        except Forbidden:
-            logger.warning("Пользователь %s заблокировал бота", user.login)
-        except TelegramError:
-            logger.exception("Ошибка отправки пользователю %s", user.login)
+        # 2) Принятие решения — только для head и admin.
+        if (user.is_head or user.is_admin) and df_decision is not None:
+            ddeals = decision_deals(df_decision, cfg)
+            if not (ddeals.empty and not cfg.send_when_empty):
+                messages.append((build_decision_message(name, ddeals, cfg), _keyboard_for(user)))
+
+        for text, reply_markup in messages:
+            try:
+                await _send_html(context.bot, chat_id, text, reply_markup=reply_markup)
+                sent += 1
+            except Forbidden:
+                logger.warning("Пользователь %s заблокировал бота", user.login)
+                break
+            except TelegramError:
+                logger.exception("Ошибка отправки пользователю %s", user.login)
 
     logger.info("Авторассылка завершена: отправлено %s сообщений", sent)
 
@@ -343,16 +365,18 @@ def main() -> None:
     )
     app.add_handler(CallbackQueryHandler(on_manager_button, pattern=rf"^{MGR_PREFIX}\d+$"))
 
-    app.job_queue.run_daily(
-        send_daily_reports,
-        time=time(hour=cfg.send_hour, minute=cfg.send_minute, tzinfo=ZoneInfo(cfg.timezone)),
-        name="daily_reports",
-    )
+    tz = ZoneInfo(cfg.timezone)
+    for hour, minute in cfg.send_times:
+        app.job_queue.run_daily(
+            send_daily_reports,
+            time=time(hour=hour, minute=minute, tzinfo=tz),
+            name=f"daily_{hour:02d}{minute:02d}",
+        )
 
     admins = sum(1 for u in cfg.users if u.is_admin)
     logger.info(
-        "Бот запущен. Рассылка в %02d:%02d %s. Пользователей: %d (админов: %d)",
-        cfg.send_hour, cfg.send_minute, cfg.timezone, len(cfg.users), admins,
+        "Бот запущен. Рассылка в %s %s. Пользователей: %d (админов: %d)",
+        _times_str(cfg), cfg.timezone, len(cfg.users), admins,
     )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
