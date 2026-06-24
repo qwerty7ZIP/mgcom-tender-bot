@@ -33,8 +33,10 @@ from ingest import start_ingest_server
 from sheets import (
     SnapshotNotReady,
     build_admin_message,
+    build_decision_message,
     build_message,
     build_setter_section,
+    decision_deals,
     fetch_dataframe,
     overdue_all,
     overdue_for_setter,
@@ -49,6 +51,7 @@ logger = logging.getLogger("mgcom_nb_bot")
 
 BUTTON_MANAGER = "Мои просроченные"
 BUTTON_ADMIN = "Все просроченные"
+BUTTON_DECISION = "Принятие решения"
 MGR_PREFIX = "mgr:"
 MESSAGE_LIMIT = 4000
 
@@ -59,6 +62,20 @@ def _manager_keyboard() -> ReplyKeyboardMarkup:
 
 def _admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([[BUTTON_ADMIN]], resize_keyboard=True, is_persistent=True)
+
+
+def _head_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[BUTTON_MANAGER, BUTTON_DECISION]], resize_keyboard=True, is_persistent=True
+    )
+
+
+def _keyboard_for(user: User) -> ReplyKeyboardMarkup:
+    if user.is_admin:
+        return _admin_keyboard()
+    if user.is_head:
+        return _head_keyboard()
+    return _manager_keyboard()
 
 
 def _managers_inline(cfg: Config) -> InlineKeyboardMarkup | None:
@@ -145,6 +162,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "«Все просроченные» под полем ввода покажет общий список в любой момент.",
             reply_markup=_admin_keyboard(),
         )
+    elif user.is_head:
+        name = user.greeting or user.setter
+        await update.message.reply_text(
+            f"{name}, привет! 👋\n\n"
+            "Я слежу за твоими просроченными сделками и сделками на принятие решения.\n\n"
+            f"Каждый день в {when} по Москве я пришлю список твоих просроченных сделок "
+            "(где ты постановщик, а дедлайн уже прошёл). Кнопки под полем ввода:\n"
+            "• «Мои просроченные» — актуальная просрочка по тебе;\n"
+            "• «Принятие решения» — сделки, ожидающие решения.\n\n"
+            f"Я узнал тебя как постановщика: {user.setter}.",
+            reply_markup=_head_keyboard(),
+        )
     else:
         name = user.greeting or user.setter
         await update.message.reply_text(
@@ -180,11 +209,35 @@ async def on_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         else:
             greeting = _greeting_for(user, tg_user.first_name if tg_user else None)
             text = build_message(greeting, overdue_for_setter(df, user.setter, cfg), cfg)
-            await _send_html(context.bot, chat_id, text, reply_markup=_manager_keyboard())
+            await _send_html(context.bot, chat_id, text, reply_markup=_keyboard_for(user))
     except SnapshotNotReady as exc:
         await update.message.reply_text(str(exc))
     except Exception:
         logger.exception("Ошибка запроса для %s", user.login)
+        await update.message.reply_text("Не удалось загрузить данные из таблицы. Попробуйте позже.")
+
+
+async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «Принятие решения» — список сделок из листа decision_sheet (для руководителя)."""
+    cfg: Config = context.application.bot_data["cfg"]
+    store: SubscriberStore = context.application.bot_data["store"]
+
+    tg_user = update.effective_user
+    user = _user_by_username(cfg, tg_user.username if tg_user else None)
+    if user is None or not user.is_head:
+        await update.message.reply_text("Доступ ограничен.")
+        return
+
+    store.set(user.login, update.effective_chat.id)
+    greeting = _greeting_for(user, tg_user.first_name if tg_user else None)
+    try:
+        df = fetch_dataframe(cfg, sheet=cfg.decision_sheet)
+        text = build_decision_message(greeting, decision_deals(df, cfg), cfg)
+        await _send_html(context.bot, update.effective_chat.id, text, reply_markup=_keyboard_for(user))
+    except SnapshotNotReady as exc:
+        await update.message.reply_text(str(exc))
+    except Exception:
+        logger.exception("Ошибка «Принятие решения» для %s", user.login)
         await update.message.reply_text("Не удалось загрузить данные из таблицы. Попробуйте позже.")
 
 
@@ -284,6 +337,9 @@ def main() -> None:
             filters.TEXT & filters.Regex(f"^({BUTTON_MANAGER}|{BUTTON_ADMIN})$"),
             on_request,
         )
+    )
+    app.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(f"^{BUTTON_DECISION}$"), on_decision)
     )
     app.add_handler(CallbackQueryHandler(on_manager_button, pattern=rf"^{MGR_PREFIX}\d+$"))
 

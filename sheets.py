@@ -19,11 +19,19 @@ class SnapshotNotReady(RuntimeError):
     """Снапшот ещё ни разу не получен от Apps Script."""
 
 
-def fetch_dataframe(cfg: Config) -> pd.DataFrame:
-    """Читает последний снапшот таблицы из локального файла и возвращает DataFrame.
+def _df_from_block(header: list, rows: list) -> pd.DataFrame:
+    header = [str(c).strip() for c in header]
+    df = pd.DataFrame(rows, columns=header if header else None).astype(str)
+    return df.fillna("")
+
+
+def fetch_dataframe(cfg: Config, sheet: str | None = None) -> pd.DataFrame:
+    """Читает лист из локального снапшота и возвращает DataFrame (всё как строки).
 
     Снапшот присылает Apps Script (push) на HTTP-эндпоинт бота — см. ingest.py.
-    Формат файла: {"updated_at": ..., "header": [...], "rows": [[...], ...]}.
+    Новый формат: {"updated_at": ..., "sheets": {"<имя>": {"header":[...], "rows":[...]}}}.
+    Поддерживается и старый формат {"header":[...], "rows":[...]} (только основной лист).
+    sheet=None — основной лист (cfg.primary_sheet).
     """
     path = cfg.snapshot_path
     if not os.path.exists(path):
@@ -33,11 +41,21 @@ def fetch_dataframe(cfg: Config) -> pd.DataFrame:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    header = [str(c).strip() for c in data.get("header", [])]
-    rows = data.get("rows", [])
-    df = pd.DataFrame(rows, columns=header if header else None).astype(str)
-    df = df.fillna("")
-    return df
+    name = sheet or cfg.primary_sheet
+    sheets = data.get("sheets")
+    if isinstance(sheets, dict):
+        block = sheets.get(name)
+        if block is None:
+            raise SnapshotNotReady(
+                f"Лист «{name}» ещё не получен от Apps Script. "
+                "Проверь, что он указан в списке листов в Code.gs."
+            )
+        return _df_from_block(block.get("header", []), block.get("rows", []))
+
+    # Старый одно-листовый формат — доступен только основной лист.
+    if sheet and sheet != cfg.primary_sheet:
+        raise SnapshotNotReady(f"Лист «{name}» ещё не получен от Apps Script.")
+    return _df_from_block(data.get("header", []), data.get("rows", []))
 
 
 def _ensure_columns(df: pd.DataFrame, cfg: Config) -> None:
@@ -80,14 +98,42 @@ def _deal_line(row: pd.Series, cfg: Config) -> str:
     return name
 
 
-def build_message(greeting: str, deals: pd.DataFrame, cfg: Config) -> str:
-    """HTML-сообщение со списком сделок-гиперссылок (для менеджера, как на образце)."""
+def decision_deals(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Все сделки из листа «Принятие чистка» (нужны только Название и Ссылка)."""
+    missing = [c for c in (cfg.col_name, cfg.col_link) if c not in df.columns]
+    if missing:
+        raise RuntimeError(
+            "В листе «Принятие чистка» нет колонок: "
+            + ", ".join(missing)
+            + f". Доступные колонки: {list(df.columns)}"
+        )
+    return df[df[cfg.col_name].astype(str).str.strip() != ""]
+
+
+def _build_list(greeting: str, deals: pd.DataFrame, cfg: Config, *, title: str, empty: str) -> str:
     greet = html.escape(greeting) if greeting else "Привет"
     if deals.empty:
-        return f"{greet}, привет!\nПросроченных сделок нет 👍"
-
+        return f"{greet}, привет!\n{empty}"
     lines = [_deal_line(row, cfg) for _, row in deals.iterrows()]
-    return f"{greet}, привет!\nСделки с просроченным ДЛ:\n\n" + "\n".join(lines)
+    return f"{greet}, привет!\n{title}\n\n" + "\n".join(lines)
+
+
+def build_message(greeting: str, deals: pd.DataFrame, cfg: Config) -> str:
+    """HTML-сообщение со списком просроченных сделок (для менеджера, как на образце)."""
+    return _build_list(
+        greeting, deals, cfg,
+        title="Сделки с просроченным ДЛ:",
+        empty="Просроченных сделок нет 👍",
+    )
+
+
+def build_decision_message(greeting: str, deals: pd.DataFrame, cfg: Config) -> str:
+    """HTML-сообщение со списком сделок на принятие решения (для руководителя)."""
+    return _build_list(
+        greeting, deals, cfg,
+        title="Сделки на принятие решения:",
+        empty="Сделок на принятие решения нет 👍",
+    )
 
 
 def build_setter_section(setter: str, deals: pd.DataFrame, cfg: Config) -> str:

@@ -15,13 +15,17 @@ class User:
     """Доверенный пользователь: маппинг логин ТГ -> постановщик + роль."""
 
     login: str  # username в Telegram, без @, в нижнем регистре
-    setter: str  # значение в колонке "Постановщик" (обязателен для роли manager)
+    setter: str  # значение в колонке "Постановщик" (обязателен для manager/head)
     greeting: str = ""  # как обращаться; если пусто — берётся имя из Telegram
-    role: str = "manager"  # "manager" или "admin"
+    role: str = "manager"  # "manager", "admin" или "head"
 
     @property
     def is_admin(self) -> bool:
         return self.role == "admin"
+
+    @property
+    def is_head(self) -> bool:
+        return self.role == "head"
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,10 @@ class Config:
     col_deadline: str = "Дата окончания"
     col_link: str = "Ссылка"
 
+    # Имена листов в Google-таблице (должны совпадать с теми, что шлёт Apps Script).
+    primary_sheet: str = "Просрок чистка"  # источник просроченных сделок
+    decision_sheet: str = "Принятие чистка"  # источник для кнопки "Принятие решения"
+
     # Слать ли сообщение, если просроченных сделок нет (для авторассылки в 11:00).
     send_when_empty: bool = False
 
@@ -65,8 +73,18 @@ def _require(name: str) -> str:
     return value
 
 
+_ROLE_ALIASES = {
+    "manager": "manager",
+    "менеджер": "manager",
+    "admin": "admin",
+    "админ": "admin",
+    "head": "head",
+    "руководитель": "head",
+}
+
+
 def _parse_users(raw: str) -> list[User]:
-    """USERS_JSON — JSON-массив объектов {login, setter, greeting?}."""
+    """USERS_JSON — JSON-массив объектов {login, setter, greeting?, role?}."""
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -82,16 +100,17 @@ def _parse_users(raw: str) -> list[User]:
         login = str(item.get("login", "")).strip().lstrip("@").lower()
         setter = str(item.get("setter", "")).strip()
         greeting = str(item.get("greeting", "")).strip()
-        role = (str(item.get("role", "manager")).strip().lower() or "manager")
-        if role not in {"manager", "admin"}:
+        role_raw = (str(item.get("role", "manager")).strip().lower() or "manager")
+        role = _ROLE_ALIASES.get(role_raw)
+        if role is None:
             raise RuntimeError(
-                f"USERS_JSON[{i}]: 'role' должно быть 'manager' или 'admin'"
+                f"USERS_JSON[{i}]: 'role' должно быть 'manager', 'admin' или 'head'"
             )
         if not login:
             raise RuntimeError(f"USERS_JSON[{i}]: поле 'login' обязательно")
-        if role == "manager" and not setter:
+        if role in {"manager", "head"} and not setter:
             raise RuntimeError(
-                f"USERS_JSON[{i}]: поле 'setter' обязательно для роли 'manager'"
+                f"USERS_JSON[{i}]: поле 'setter' обязательно для роли '{role}'"
             )
         users.append(User(login=login, setter=setter, greeting=greeting, role=role))
     if not users:
@@ -128,6 +147,8 @@ def load_config() -> Config:
         col_deadline=os.getenv("COL_DEADLINE", "Дата окончания").strip()
         or "Дата окончания",
         col_link=os.getenv("COL_LINK", "Ссылка").strip() or "Ссылка",
+        primary_sheet=os.getenv("PRIMARY_SHEET", "Просрок чистка").strip() or "Просрок чистка",
+        decision_sheet=os.getenv("DECISION_SHEET", "Принятие чистка").strip() or "Принятие чистка",
         send_when_empty=_bool("SEND_WHEN_EMPTY", False),
         data_dir=os.getenv("DATA_DIR", "data").strip() or "data",
         users_by_login={u.login: u for u in users},

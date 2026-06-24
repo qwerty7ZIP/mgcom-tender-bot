@@ -72,16 +72,21 @@ def _make_handler(cfg: Config):
                 self._reply(400, "invalid json")
                 return
 
-            if not isinstance(data, dict) or "header" not in data or "rows" not in data:
-                self._reply(400, "expected {header, rows}")
+            has_multi = isinstance(data, dict) and isinstance(data.get("sheets"), dict)
+            has_legacy = isinstance(data, dict) and "header" in data and "rows" in data
+            if not (has_multi or has_legacy):
+                self._reply(400, "expected {sheets} or {header, rows}")
                 return
 
             _atomic_write(cfg.snapshot_path, raw)
-            logger.info(
-                "Снапшот получен: %d строк, updated_at=%s",
-                len(data.get("rows", [])),
-                data.get("updated_at"),
-            )
+            if has_multi:
+                summary = ", ".join(
+                    f"{name}: {len(block.get('rows', []))}"
+                    for name, block in data["sheets"].items()
+                )
+            else:
+                summary = f"{len(data.get('rows', []))} строк"
+            logger.info("Снапшот получен (%s), updated_at=%s", summary, data.get("updated_at"))
             self._reply(200, "ok")
 
         def log_message(self, fmt: str, *args) -> None:  # тише в логах
