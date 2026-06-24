@@ -12,11 +12,16 @@ load_dotenv()
 
 @dataclass(frozen=True)
 class User:
-    """Доверенный пользователь: маппинг логин ТГ -> постановщик в таблице."""
+    """Доверенный пользователь: маппинг логин ТГ -> постановщик + роль."""
 
     login: str  # username в Telegram, без @, в нижнем регистре
-    setter: str  # значение в колонке "Постановщик"
+    setter: str  # значение в колонке "Постановщик" (обязателен для роли manager)
     greeting: str = ""  # как обращаться; если пусто — берётся имя из Telegram
+    role: str = "manager"  # "manager" или "admin"
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == "admin"
 
 
 @dataclass(frozen=True)
@@ -77,11 +82,18 @@ def _parse_users(raw: str) -> list[User]:
         login = str(item.get("login", "")).strip().lstrip("@").lower()
         setter = str(item.get("setter", "")).strip()
         greeting = str(item.get("greeting", "")).strip()
-        if not login or not setter:
+        role = (str(item.get("role", "manager")).strip().lower() or "manager")
+        if role not in {"manager", "admin"}:
             raise RuntimeError(
-                f"USERS_JSON[{i}]: поля 'login' и 'setter' обязательны"
+                f"USERS_JSON[{i}]: 'role' должно быть 'manager' или 'admin'"
             )
-        users.append(User(login=login, setter=setter, greeting=greeting))
+        if not login:
+            raise RuntimeError(f"USERS_JSON[{i}]: поле 'login' обязательно")
+        if role == "manager" and not setter:
+            raise RuntimeError(
+                f"USERS_JSON[{i}]: поле 'setter' обязательно для роли 'manager'"
+            )
+        users.append(User(login=login, setter=setter, greeting=greeting, role=role))
     if not users:
         raise RuntimeError("USERS_JSON не содержит ни одного пользователя")
     return users

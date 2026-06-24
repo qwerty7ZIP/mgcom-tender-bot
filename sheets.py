@@ -51,41 +51,72 @@ def _ensure_columns(df: pd.DataFrame, cfg: Config) -> None:
         )
 
 
-def overdue_for_setter(df: pd.DataFrame, setter: str, cfg: Config) -> pd.DataFrame:
-    """Возвращает просроченные сделки конкретного постановщика.
-
-    Просроченная = "Дата окончания" строго раньше сегодняшней даты (по TZ из конфига).
-    """
-    _ensure_columns(df, cfg)
-
-    mine = df[df[cfg.col_setter].str.strip().str.casefold() == setter.strip().casefold()]
-    if mine.empty:
-        return mine
-
-    deadlines = pd.to_datetime(
-        mine[cfg.col_deadline], errors="coerce", dayfirst=True
-    )
+def _overdue_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
+    """Маска просроченных строк: "Дата окончания" строго раньше сегодня (по TZ)."""
+    deadlines = pd.to_datetime(df[cfg.col_deadline], errors="coerce", dayfirst=True)
     today = datetime.now(ZoneInfo(cfg.timezone)).date()
-    overdue_mask = deadlines.dt.date < today
-    # Строки с нераспознанной датой пропускаем (NaT -> mask False).
-    return mine[overdue_mask.fillna(False)]
+    # Строки с нераспознанной датой пропускаем (NaT -> False).
+    return (deadlines.dt.date < today).fillna(False)
+
+
+def overdue_for_setter(df: pd.DataFrame, setter: str, cfg: Config) -> pd.DataFrame:
+    """Просроченные сделки конкретного постановщика."""
+    _ensure_columns(df, cfg)
+    by_setter = df[cfg.col_setter].str.strip().str.casefold() == setter.strip().casefold()
+    return df[by_setter & _overdue_mask(df, cfg)]
+
+
+def overdue_all(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Все просроченные сделки (по всем постановщикам)."""
+    _ensure_columns(df, cfg)
+    return df[_overdue_mask(df, cfg)]
+
+
+def _deal_line(row: pd.Series, cfg: Config) -> str:
+    name = html.escape(str(row[cfg.col_name]).strip()) or "(без названия)"
+    url = str(row[cfg.col_link]).strip()
+    if url:
+        return f'<a href="{html.escape(url, quote=True)}">{name}</a>'
+    return name
 
 
 def build_message(greeting: str, deals: pd.DataFrame, cfg: Config) -> str:
-    """Собирает HTML-сообщение со списком сделок-гиперссылок (как на образце)."""
+    """HTML-сообщение со списком сделок-гиперссылок (для менеджера, как на образце)."""
     greet = html.escape(greeting) if greeting else "Привет"
     if deals.empty:
         return f"{greet}, привет!\nПросроченных сделок нет 👍"
 
-    lines = []
-    for _, row in deals.iterrows():
-        name = html.escape(str(row[cfg.col_name]).strip()) or "(без названия)"
-        url = str(row[cfg.col_link]).strip()
-        if url:
-            safe_url = html.escape(url, quote=True)
-            lines.append(f'<a href="{safe_url}">{name}</a>')
-        else:
-            lines.append(name)
+    lines = [_deal_line(row, cfg) for _, row in deals.iterrows()]
+    return f"{greet}, привет!\nСделки с просроченным ДЛ:\n\n" + "\n".join(lines)
 
-    header = f"{greet}, привет!\nСделки с просроченным ДЛ:"
-    return header + "\n\n" + "\n".join(lines)
+
+def build_setter_section(setter: str, deals: pd.DataFrame, cfg: Config) -> str:
+    """HTML-сообщение по одному постановщику (для админа по кнопке менеджера)."""
+    title = html.escape(setter.strip()) or "(без постановщика)"
+    if deals.empty:
+        return f"Просроченные сделки — {title}:\nНет 👍"
+    lines = [_deal_line(row, cfg) for _, row in deals.iterrows()]
+    return f"Просроченные сделки — {title}:\n\n" + "\n".join(lines)
+
+
+def build_admin_message(greeting: str, overdue: pd.DataFrame, cfg: Config) -> str:
+    """Общий список просроченных сделок, сгруппированный по постановщикам (для админа)."""
+    greet = html.escape(greeting) if greeting else "Коллеги"
+    if overdue.empty:
+        return f"{greet}, привет!\nПросроченных сделок нет ни у кого 👍"
+
+    setters = overdue[cfg.col_setter].astype(str).str.strip()
+    parts = [f"{greet}, привет!", "Все просроченные сделки по менеджерам:", ""]
+
+    for setter in sorted({s for s in setters if s}):
+        group = overdue[setters == setter]
+        parts.append(f"<b>{html.escape(setter)}</b>")
+        parts.extend(_deal_line(row, cfg) for _, row in group.iterrows())
+        parts.append("")
+
+    empties = overdue[setters == ""]
+    if not empties.empty:
+        parts.append("<b>(без постановщика)</b>")
+        parts.extend(_deal_line(row, cfg) for _, row in empties.iterrows())
+
+    return "\n".join(parts).strip()
