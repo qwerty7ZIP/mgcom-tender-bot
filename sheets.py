@@ -90,6 +90,16 @@ def overdue_all(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return df[_overdue_mask(df, cfg)]
 
 
+def filter_setter(df: pd.DataFrame, setter: str, cfg: Config) -> pd.DataFrame:
+    """Строки конкретного постановщика без фильтра по дате.
+
+    Используется для листа «Принятие решения» — там дата не важна.
+    """
+    return df[
+        df[cfg.col_setter].astype(str).str.strip().str.casefold() == setter.strip().casefold()
+    ]
+
+
 def _deal_line(row: pd.Series, cfg: Config) -> str:
     name = html.escape(str(row[cfg.col_name]).strip()) or "(без названия)"
     url = str(row[cfg.col_link]).strip()

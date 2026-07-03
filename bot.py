@@ -1,14 +1,15 @@
-"""Telegram-бот: рассылка просроченных сделок в 11:00 МСК.
+"""Telegram-бот: рассылка просроченных сделок и сделок на принятие решения.
 
-Роли (задаются в USERS_JSON):
-- manager: получает свои просроченные сделки; кнопка «Мои просроченные».
-- admin:   получает общий список по всем менеджерам + инлайн-кнопки по каждому
-           менеджеру (подпись = setter); кнопка «Все просроченные».
+Роли (задаются в USERS_JSON / users.json):
+- manager: свои просроченные сделки; кнопка «Мои просроченные».
+- head/admin: 4 кнопки — «Мои просроченные», «Все просроченные»,
+           «Мои решения», «Все решения». admin дополнительно получает
+           инлайн-кнопки по каждому менеджеру (подпись = setter).
 """
 from __future__ import annotations
 
 import logging
-from datetime import time
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from telegram import (
@@ -38,6 +39,7 @@ from sheets import (
     build_setter_section,
     decision_deals,
     fetch_dataframe,
+    filter_setter,
     overdue_all,
     overdue_for_setter,
 )
@@ -49,34 +51,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mgcom_nb_bot")
 
-BUTTON_MANAGER = "Мои просроченные"
-BUTTON_ADMIN = "Все просроченные"
-BUTTON_DECISION = "Принятие решения"
+BUTTON_MY_OVERDUE = "Мои просроченные"
+BUTTON_ALL_OVERDUE = "Все просроченные"
+BUTTON_MY_DECISION = "Мои решения"
+BUTTON_ALL_DECISION = "Все решения"
 MGR_PREFIX = "mgr:"
 MESSAGE_LIMIT = 4000
 
 
 def _manager_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([[BUTTON_MANAGER]], resize_keyboard=True, is_persistent=True)
+    return ReplyKeyboardMarkup([[BUTTON_MY_OVERDUE]], resize_keyboard=True, is_persistent=True)
 
 
-def _admin_keyboard() -> ReplyKeyboardMarkup:
+def _head_admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BUTTON_ADMIN, BUTTON_DECISION]], resize_keyboard=True, is_persistent=True
-    )
-
-
-def _head_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [[BUTTON_MANAGER, BUTTON_DECISION]], resize_keyboard=True, is_persistent=True
+        [
+            [BUTTON_MY_OVERDUE, BUTTON_ALL_OVERDUE],
+            [BUTTON_MY_DECISION, BUTTON_ALL_DECISION],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
     )
 
 
 def _keyboard_for(user: User) -> ReplyKeyboardMarkup:
-    if user.is_admin:
-        return _admin_keyboard()
-    if user.is_head:
-        return _head_keyboard()
+    if user.is_admin or user.is_head:
+        return _head_admin_keyboard()
     return _manager_keyboard()
 
 
@@ -157,30 +157,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     when = _times_str(cfg)
-    if user.is_admin:
-        name = user.greeting or "коллега"
+    if user.is_admin or user.is_head:
+        name = user.greeting or user.setter or "коллега"
         await update.message.reply_text(
             f"{name}, привет! 👋\n\n"
-            "Я слежу за просроченными сделками по всем менеджерам.\n\n"
-            f"Каждый день в {when} по Москве я пришлю общий список просроченных сделок, "
-            "сгруппированный по менеджерам, и список сделок на принятие решения. "
-            "Под сообщением будут кнопки по каждому менеджеру — нажми, чтобы получить "
-            "только его сделки. Кнопки под полем ввода:\n"
-            "• «Все просроченные» — общий список просрочки;\n"
-            "• «Принятие решения» — сделки, ожидающие решения.",
-            reply_markup=_admin_keyboard(),
-        )
-    elif user.is_head:
-        name = user.greeting or user.setter
-        await update.message.reply_text(
-            f"{name}, привет! 👋\n\n"
-            "Я слежу за твоими просроченными сделками и сделками на принятие решения.\n\n"
-            f"Каждый день в {when} по Москве я пришлю список твоих просроченных сделок "
-            "(где ты постановщик, а дедлайн уже прошёл). Кнопки под полем ввода:\n"
-            "• «Мои просроченные» — актуальная просрочка по тебе;\n"
-            "• «Принятие решения» — сделки, ожидающие решения.\n\n"
+            "Я слежу за просроченными сделками и сделками на принятие решения.\n\n"
+            f"Каждый день в {when} по Москве я пришлю сводку. "
+            "Кнопки под полем ввода:\n"
+            "• «Мои просроченные» — просрочка, где ты постановщик;\n"
+            "• «Все просроченные» — общий список по всем менеджерам;\n"
+            "• «Мои решения» — сделки на принятие решения по тебе;\n"
+            "• «Все решения» — все сделки на принятие решения.\n\n"
             f"Я узнал тебя как постановщика: {user.setter}.",
-            reply_markup=_head_keyboard(),
+            reply_markup=_head_admin_keyboard(),
         )
     else:
         name = user.greeting or user.setter
@@ -195,58 +184,111 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-async def on_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запрос сделок по команде /deals или по кнопке (роле-зависимо)."""
+async def _reply_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE, user: User, *, mine: bool) -> None:
+    """Просроченные сделки из Google-снапшота: mine=True — свои, иначе все (сгруппировано)."""
+    cfg: Config = context.application.bot_data["cfg"]
+    chat_id = update.effective_chat.id
+    tg_user = update.effective_user
+
+    try:
+        df = fetch_dataframe(cfg)
+    except SnapshotNotReady as exc:
+        await update.message.reply_text(str(exc))
+        return
+    except Exception:
+        logger.exception("Ошибка чтения снапшота просрочки для %s", user.login)
+        await update.message.reply_text("Не удалось загрузить данные из таблицы. Попробуйте позже.")
+        return
+
+    if mine:
+        greeting = _greeting_for(user, tg_user.first_name if tg_user else None)
+        text = build_message(greeting, overdue_for_setter(df, user.setter, cfg), cfg)
+        await _send_html(context.bot, chat_id, text, reply_markup=_keyboard_for(user))
+    else:
+        name = user.greeting or user.setter or "Коллеги"
+        inline = _managers_inline(cfg) if user.is_admin else None
+        text = build_admin_message(name, overdue_all(df, cfg), cfg)
+        await _send_html(context.bot, chat_id, text, reply_markup=inline)
+
+
+async def _reply_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, user: User, *, mine: bool) -> None:
+    """Принятие решения из листа decision_sheet: mine=True — только свои, иначе все."""
+    cfg: Config = context.application.bot_data["cfg"]
+    chat_id = update.effective_chat.id
+    tg_user = update.effective_user
+
+    try:
+        df = fetch_dataframe(cfg, sheet=cfg.decision_sheet)
+    except SnapshotNotReady as exc:
+        await update.message.reply_text(str(exc))
+        return
+    except Exception:
+        logger.exception("Ошибка «решения» для %s", user.login)
+        await update.message.reply_text("Не удалось загрузить данные из таблицы. Попробуйте позже.")
+        return
+
+    deals = decision_deals(df, cfg)
+    if mine:
+        greeting = _greeting_for(user, tg_user.first_name if tg_user else None)
+        if cfg.col_setter not in deals.columns:
+            await update.message.reply_text(
+                f"В листе «{cfg.decision_sheet}» нет колонки «{cfg.col_setter}» — "
+                "не могу отфильтровать по постановщику. Доступны «Все решения»."
+            )
+            return
+        deals = filter_setter(deals, user.setter, cfg)
+        text = build_decision_message(greeting, deals, cfg)
+    else:
+        text = build_decision_message(user.greeting or user.setter or "Коллеги", deals, cfg)
+    await _send_html(context.bot, chat_id, text, reply_markup=_keyboard_for(user))
+
+
+async def on_my_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.application.bot_data["cfg"]
     store: SubscriberStore = context.application.bot_data["store"]
-
     tg_user = update.effective_user
     user = _user_by_username(cfg, tg_user.username if tg_user else None)
     if user is None:
         await update.message.reply_text("Доступ ограничен.")
         return
-
     store.set(user.login, update.effective_chat.id)
-    chat_id = update.effective_chat.id
-
-    try:
-        df = fetch_dataframe(cfg)
-        if user.is_admin:
-            text = build_admin_message(user.greeting or "Коллеги", overdue_all(df, cfg), cfg)
-            await _send_html(context.bot, chat_id, text, reply_markup=_managers_inline(cfg))
-        else:
-            greeting = _greeting_for(user, tg_user.first_name if tg_user else None)
-            text = build_message(greeting, overdue_for_setter(df, user.setter, cfg), cfg)
-            await _send_html(context.bot, chat_id, text, reply_markup=_keyboard_for(user))
-    except SnapshotNotReady as exc:
-        await update.message.reply_text(str(exc))
-    except Exception:
-        logger.exception("Ошибка запроса для %s", user.login)
-        await update.message.reply_text("Не удалось загрузить данные из таблицы. Попробуйте позже.")
+    await _reply_overdue(update, context, user, mine=True)
 
 
-async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка «Принятие решения» — список сделок из листа decision_sheet (для руководителя)."""
+async def on_all_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.application.bot_data["cfg"]
     store: SubscriberStore = context.application.bot_data["store"]
-
     tg_user = update.effective_user
     user = _user_by_username(cfg, tg_user.username if tg_user else None)
     if user is None or not (user.is_head or user.is_admin):
         await update.message.reply_text("Доступ ограничен.")
         return
-
     store.set(user.login, update.effective_chat.id)
-    greeting = _greeting_for(user, tg_user.first_name if tg_user else None)
-    try:
-        df = fetch_dataframe(cfg, sheet=cfg.decision_sheet)
-        text = build_decision_message(greeting, decision_deals(df, cfg), cfg)
-        await _send_html(context.bot, update.effective_chat.id, text, reply_markup=_keyboard_for(user))
-    except SnapshotNotReady as exc:
-        await update.message.reply_text(str(exc))
-    except Exception:
-        logger.exception("Ошибка «Принятие решения» для %s", user.login)
-        await update.message.reply_text("Не удалось загрузить данные из таблицы. Попробуйте позже.")
+    await _reply_overdue(update, context, user, mine=False)
+
+
+async def on_my_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.application.bot_data["cfg"]
+    store: SubscriberStore = context.application.bot_data["store"]
+    tg_user = update.effective_user
+    user = _user_by_username(cfg, tg_user.username if tg_user else None)
+    if user is None or not (user.is_head or user.is_admin):
+        await update.message.reply_text("Доступ ограничен.")
+        return
+    store.set(user.login, update.effective_chat.id)
+    await _reply_decision(update, context, user, mine=True)
+
+
+async def on_all_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.application.bot_data["cfg"]
+    store: SubscriberStore = context.application.bot_data["store"]
+    tg_user = update.effective_user
+    user = _user_by_username(cfg, tg_user.username if tg_user else None)
+    if user is None or not (user.is_head or user.is_admin):
+        await update.message.reply_text("Доступ ограничен.")
+        return
+    store.set(user.login, update.effective_chat.id)
+    await _reply_decision(update, context, user, mine=False)
 
 
 async def on_manager_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -269,9 +311,9 @@ async def on_manager_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.message.reply_text("Неизвестный менеджер.")
         return
 
+    chat_id = query.message.chat_id
     try:
         df = fetch_dataframe(cfg)
-        deals = overdue_for_setter(df, target.setter, cfg)
     except SnapshotNotReady as exc:
         await query.message.reply_text(str(exc))
         return
@@ -280,24 +322,30 @@ async def on_manager_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.message.reply_text("Не удалось загрузить данные из таблицы. Попробуйте позже.")
         return
 
-    text = build_setter_section(target.setter, deals, cfg)
-    await _send_html(context.bot, query.message.chat_id, text)
+    text = build_setter_section(target.setter, overdue_for_setter(df, target.setter, cfg), cfg)
+    await _send_html(context.bot, chat_id, text)
 
 
 async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.application.bot_data["cfg"]
     store: SubscriberStore = context.application.bot_data["store"]
 
+    # По выходным (суббота, воскресенье) авторассылку не делаем.
+    weekday = datetime.now(ZoneInfo(cfg.timezone)).weekday()  # 0=Пн ... 5=Сб, 6=Вс
+    if weekday >= 5:
+        logger.info("Выходной день — авторассылка пропущена")
+        return
+
+    # Просроченные — из снапшота Google (лист «Просрок чистка»).
+    df = None
     try:
         df = fetch_dataframe(cfg)
     except SnapshotNotReady:
-        logger.warning("Авторассылка пропущена: снапшот таблицы ещё не получен")
-        return
+        logger.warning("Снапшот просрочки ещё не получен — пропускаю просроченные сделки")
     except Exception:
-        logger.exception("Не удалось прочитать снапшот таблицы для авторассылки")
-        return
+        logger.exception("Авторассылка: не удалось прочитать снапшот просрочки")
 
-    # Лист принятия решения нужен только для head/admin; может быть ещё не получен.
+    # Принятие решения — из снапшота Google (нужно только head/admin).
     df_decision = None
     try:
         df_decision = fetch_dataframe(cfg, sheet=cfg.decision_sheet)
@@ -305,6 +353,10 @@ async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("Лист «%s» ещё не получен — пропускаю сообщения принятия решения", cfg.decision_sheet)
     except Exception:
         logger.exception("Не удалось прочитать лист принятия решения")
+
+    if df is None and df_decision is None:
+        logger.warning("Авторассылка пропущена: нет данных в снапшоте")
+        return
 
     sent = 0
     for user in cfg.users:
@@ -317,19 +369,23 @@ async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE) -> None:
         # Собираем сообщения для пользователя: (текст, разметка).
         messages: list[tuple[str, object]] = []
 
-        # 1) Просроченные сделки.
-        if user.is_admin:
-            overdue = overdue_all(df, cfg)
-            if not (overdue.empty and not cfg.send_when_empty):
-                messages.append((build_admin_message(name, overdue, cfg), _managers_inline(cfg)))
-        else:
-            deals = overdue_for_setter(df, user.setter, cfg)
-            if not (deals.empty and not cfg.send_when_empty):
-                messages.append((build_message(name, deals, cfg), _keyboard_for(user)))
+        # 1) Просроченные сделки (из снапшота Google).
+        if df is not None:
+            if user.is_admin:
+                deals = overdue_all(df, cfg)
+                if not (deals.empty and not cfg.send_when_empty):
+                    messages.append((build_admin_message(name, deals, cfg), _managers_inline(cfg)))
+            else:
+                deals = overdue_for_setter(df, user.setter, cfg)
+                if not (deals.empty and not cfg.send_when_empty):
+                    messages.append((build_message(name, deals, cfg), _keyboard_for(user)))
 
         # 2) Принятие решения — только для head и admin.
+        #    admin — все решения, head — только свои (по setter).
         if (user.is_head or user.is_admin) and df_decision is not None:
             ddeals = decision_deals(df_decision, cfg)
+            if user.is_head and not user.is_admin:
+                ddeals = filter_setter(ddeals, user.setter, cfg)
             if not (ddeals.empty and not cfg.send_when_empty):
                 messages.append((build_decision_message(name, ddeals, cfg), _keyboard_for(user)))
 
@@ -357,15 +413,18 @@ def main() -> None:
     app.bot_data["store"] = store
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("deals", on_request))
+    app.add_handler(CommandHandler("deals", on_my_overdue))
     app.add_handler(
-        MessageHandler(
-            filters.TEXT & filters.Regex(f"^({BUTTON_MANAGER}|{BUTTON_ADMIN})$"),
-            on_request,
-        )
+        MessageHandler(filters.TEXT & filters.Regex(f"^{BUTTON_MY_OVERDUE}$"), on_my_overdue)
     )
     app.add_handler(
-        MessageHandler(filters.TEXT & filters.Regex(f"^{BUTTON_DECISION}$"), on_decision)
+        MessageHandler(filters.TEXT & filters.Regex(f"^{BUTTON_ALL_OVERDUE}$"), on_all_overdue)
+    )
+    app.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(f"^{BUTTON_MY_DECISION}$"), on_my_decision)
+    )
+    app.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(f"^{BUTTON_ALL_DECISION}$"), on_all_decision)
     )
     app.add_handler(CallbackQueryHandler(on_manager_button, pattern=rf"^{MGR_PREFIX}\d+$"))
 
