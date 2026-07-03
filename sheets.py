@@ -19,6 +19,19 @@ class SnapshotNotReady(RuntimeError):
     """Снапшот ещё ни разу не получен от Apps Script."""
 
 
+def _norm(value: object) -> str:
+    """Нормализует строку для сравнения имён: убирает неразрывные пробелы,
+    схлопывает любые пробельные последовательности и приводит к нижнему регистру."""
+    text = str(value).replace("\u00a0", " ").replace("\u200b", "")
+    return " ".join(text.split()).casefold()
+
+
+def _setter_mask(df: pd.DataFrame, setter: str, cfg: Config) -> pd.Series:
+    """Маска строк, где «Постановщик» совпадает с setter (устойчиво к пробелам/регистру)."""
+    target = _norm(setter)
+    return df[cfg.col_setter].map(_norm) == target
+
+
 def _df_from_block(header: list, rows: list) -> pd.DataFrame:
     header = [str(c).strip() for c in header]
     df = pd.DataFrame(rows, columns=header if header else None).astype(str)
@@ -80,8 +93,7 @@ def _overdue_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
 def overdue_for_setter(df: pd.DataFrame, setter: str, cfg: Config) -> pd.DataFrame:
     """Просроченные сделки конкретного постановщика."""
     _ensure_columns(df, cfg)
-    by_setter = df[cfg.col_setter].str.strip().str.casefold() == setter.strip().casefold()
-    return df[by_setter & _overdue_mask(df, cfg)]
+    return df[_setter_mask(df, setter, cfg) & _overdue_mask(df, cfg)]
 
 
 def overdue_all(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
@@ -94,10 +106,18 @@ def filter_setter(df: pd.DataFrame, setter: str, cfg: Config) -> pd.DataFrame:
     """Строки конкретного постановщика без фильтра по дате.
 
     Используется для листа «Принятие решения» — там дата не важна.
+    Сравнение устойчиво к неразрывным/двойным пробелам и регистру.
     """
-    return df[
-        df[cfg.col_setter].astype(str).str.strip().str.casefold() == setter.strip().casefold()
-    ]
+    if cfg.col_setter not in df.columns:
+        return df.iloc[0:0]
+    result = df[_setter_mask(df, setter, cfg)]
+    if result.empty and not df.empty:
+        distinct = sorted({str(v).strip() for v in df[cfg.col_setter] if str(v).strip()})
+        logger.info(
+            "filter_setter: нет совпадений для «%s». Значения в колонке «%s»: %s",
+            setter, cfg.col_setter, distinct,
+        )
+    return result
 
 
 def _deal_line(row: pd.Series, cfg: Config) -> str:
