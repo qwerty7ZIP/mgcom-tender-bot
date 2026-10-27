@@ -49,6 +49,7 @@ from tenders import (
     UpcomingTender,
     build_reminder_message,
     build_upcoming_message,
+    button_window,
     upcoming_tenders,
 )
 
@@ -306,7 +307,7 @@ def _can_see_tenders(user: User | None) -> bool:
 
 
 async def on_tenders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка «Ближайшие тендеры» (admin/head): все ожидаемые тендеры на ближайшие месяцы."""
+    """Кнопка «Ближайшие тендеры» (admin/head): тендеры, ожидаемые через 3 мес. ± неделя."""
     cfg: Config = context.application.bot_data["cfg"]
     store: SubscriberStore = context.application.bot_data["store"]
     tg_user = update.effective_user
@@ -318,7 +319,8 @@ async def on_tenders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     try:
         df = fetch_dataframe(cfg, sheet=cfg.tenders_sheet)
-        tenders = upcoming_tenders(df, cfg)
+        today = datetime.now(ZoneInfo(cfg.timezone)).date()
+        tenders = upcoming_tenders(df, cfg, today=today, window=button_window(cfg, today))
     except SnapshotNotReady as exc:
         await update.message.reply_text(str(exc))
         return
@@ -328,7 +330,7 @@ async def on_tenders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     greeting = _greeting_for(user, tg_user.first_name if tg_user else None)
-    text = build_upcoming_message(greeting, tenders, cfg, show_setter=True)
+    text = build_upcoming_message(greeting, tenders, cfg, show_setter=True, today=today)
     await _send_html(context.bot, update.effective_chat.id, text, reply_markup=_keyboard_for(user))
 
 

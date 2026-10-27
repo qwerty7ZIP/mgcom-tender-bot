@@ -131,8 +131,23 @@ def _client_key(df: pd.DataFrame, idx, cfg: Config) -> str:
     return str(idx)
 
 
-def upcoming_tenders(df: pd.DataFrame, cfg: Config, today: date | None = None) -> list[UpcomingTender]:
-    """Тендеры, которые ожидаются в ближайшие TENDER_LEAD_MONTHS и ещё не заведены."""
+def button_window(cfg: Config, today: date) -> tuple[date, date]:
+    """Окно для кнопки «Ближайшие тендеры»: сегодня + TENDER_LEAD_MONTHS ± TENDER_BUTTON_SPREAD_DAYS."""
+    center = (pd.Timestamp(today) + pd.DateOffset(months=cfg.tender_lead_months)).date()
+    spread = timedelta(days=cfg.tender_button_spread_days)
+    return center - spread, center + spread
+
+
+def upcoming_tenders(
+    df: pd.DataFrame,
+    cfg: Config,
+    today: date | None = None,
+    window: tuple[date, date] | None = None,
+) -> list[UpcomingTender]:
+    """Тендеры, ожидаемые в окне и ещё не заведённые.
+
+    window=None — окно для напоминаний: [сегодня − TENDER_GRACE_DAYS; сегодня + TENDER_LEAD_MONTHS].
+    """
     _ensure_tender_columns(df, cfg)
     if today is None:
         today = datetime.now(ZoneInfo(cfg.timezone)).date()
@@ -146,8 +161,11 @@ def upcoming_tenders(df: pd.DataFrame, cfg: Config, today: date | None = None) -
             any_date = any_date.fillna(_parse_dates(_column(df, col)))
     groups = _group_ids(df, cfg)
 
-    window_start = today - timedelta(days=cfg.tender_grace_days)
-    window_end = (pd.Timestamp(today) + pd.DateOffset(months=cfg.tender_lead_months)).date()
+    if window is not None:
+        window_start, window_end = window
+    else:
+        window_start = today - timedelta(days=cfg.tender_grace_days)
+        window_end = (pd.Timestamp(today) + pd.DateOffset(months=cfg.tender_lead_months)).date()
     cycle = pd.DateOffset(months=cfg.tender_cycle_months)
     fresh_gap = pd.Timedelta(days=cfg.tender_fresh_days)
 
@@ -233,13 +251,17 @@ def build_upcoming_message(
     if today is None:
         today = datetime.now(ZoneInfo(cfg.timezone)).date()
     greet = html.escape(greeting) if greeting else "Привет"
-    months = cfg.tender_lead_months
+    start, end = button_window(cfg, today)
+    period = (
+        f"примерно через {cfg.tender_lead_months} мес. "
+        f"(с {_fmt(start)} по {_fmt(end)})"
+    )
     if not tenders:
-        return f"{greet}, привет!\nНа ближайшие {months} мес. новых тендеров не ожидается 👍"
+        return f"{greet}, привет!\nТендеров {period} не ожидается 👍"
     blocks = [_tender_block(t, today, show_setter=show_setter) for t in tenders]
     header = (
-        f"{greet}, привет!\nОжидаемые тендеры на ближайшие {months} мес. "
-        f"(записи о них ещё нет), всего {len(tenders)}:"
+        f"{greet}, привет!\nОжидаемые тендеры {period}, "
+        f"записи о них ещё нет. Всего {len(tenders)}:"
     )
     return header + "\n\n" + "\n\n".join(blocks)
 

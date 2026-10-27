@@ -77,6 +77,7 @@ class Config:
     tender_cycle_months: int = 12  # через сколько ждём повторный тендер
     tender_lead_months: int = 3  # за сколько предупреждать
     tender_grace_days: int = 30  # сколько дней показывать «ожидался, но записи нет»
+    tender_button_spread_days: int = 7  # кнопка: сегодня + TENDER_LEAD_MONTHS ± N дней
     tender_fresh_days: int = 180  # запись позже прошлого тендера на N дней = тендер этого года
     tender_notify_time: tuple[int, int] | None = None  # None = первое время из SEND_TIMES
 
@@ -239,6 +240,7 @@ def _tender_settings() -> dict:
         tender_cycle_months=_int("TENDER_CYCLE_MONTHS", 12),
         tender_lead_months=_int("TENDER_LEAD_MONTHS", 3),
         tender_grace_days=_int("TENDER_GRACE_DAYS", 30),
+        tender_button_spread_days=_int("TENDER_BUTTON_SPREAD_DAYS", 7),
         tender_fresh_days=_int("TENDER_FRESH_DAYS", 180),
         tender_notify_time=_parse_times(notify_raw)[0] if notify_raw else None,
     )
