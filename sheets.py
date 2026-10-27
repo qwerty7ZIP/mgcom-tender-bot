@@ -85,9 +85,10 @@ def _ensure_columns(df: pd.DataFrame, cfg: Config) -> None:
 def _overdue_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
     """Маска просроченных строк: "Дата окончания" строго раньше сегодня (по TZ)."""
     deadlines = pd.to_datetime(df[cfg.col_deadline], errors="coerce", dayfirst=True)
-    today = datetime.now(ZoneInfo(cfg.timezone)).date()
+    today = pd.Timestamp(datetime.now(ZoneInfo(cfg.timezone)).date())
     # Строки с нераспознанной датой пропускаем (NaT -> False).
-    return (deadlines.dt.date < today).fillna(False)
+    # Сравниваем как Timestamp: так не падает, даже если ни одна дата не распознана.
+    return (deadlines.dt.normalize() < today).fillna(False)
 
 
 def overdue_for_setter(df: pd.DataFrame, setter: str, cfg: Config) -> pd.DataFrame:
