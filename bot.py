@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
@@ -19,6 +20,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
+from telegram.constants import ChatAction
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
@@ -51,6 +53,7 @@ from tenders import (
     build_upcoming_message,
     button_window,
     upcoming_tenders,
+    upcoming_tenders_cached,
 )
 
 logging.basicConfig(
@@ -317,10 +320,14 @@ async def on_tenders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     store.set(user.login, update.effective_chat.id)
 
+    # Сразу показываем «печатает…», а считаем в отдельном потоке, чтобы бот
+    # не замирал для остальных пользователей.
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     try:
-        df = fetch_dataframe(cfg, sheet=cfg.tenders_sheet)
         today = datetime.now(ZoneInfo(cfg.timezone)).date()
-        tenders = upcoming_tenders(df, cfg, today=today, window=button_window(cfg, today))
+        tenders = await asyncio.to_thread(
+            upcoming_tenders_cached, cfg, today, button_window(cfg, today)
+        )
     except SnapshotNotReady as exc:
         await update.message.reply_text(str(exc))
         return
@@ -332,6 +339,21 @@ async def on_tenders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     greeting = _greeting_for(user, tg_user.first_name if tg_user else None)
     text = build_upcoming_message(greeting, tenders, cfg, show_setter=True, today=today)
     await _send_html(context.bot, update.effective_chat.id, text, reply_markup=_keyboard_for(user))
+
+
+async def warm_tenders_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фоном заранее считает список для кнопки, чтобы она отвечала сразу.
+
+    Если данные не менялись — ничего не делает (результат уже в памяти).
+    """
+    cfg: Config = context.application.bot_data["cfg"]
+    today = datetime.now(ZoneInfo(cfg.timezone)).date()
+    try:
+        await asyncio.to_thread(upcoming_tenders_cached, cfg, today, button_window(cfg, today))
+    except SnapshotNotReady:
+        pass
+    except Exception:
+        logger.exception("Фоновый пересчёт ближайших тендеров не удался")
 
 
 async def send_tender_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -584,6 +606,7 @@ def main() -> None:
         time=time(hour=t_hour, minute=t_minute, tzinfo=tz),
         name="tender_reminders",
     )
+    app.job_queue.run_repeating(warm_tenders_cache, interval=120, first=10, name="tenders_cache")
 
     admins = sum(1 for u in cfg.users if u.is_admin)
     logger.info(

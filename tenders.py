@@ -90,10 +90,11 @@ def _ensure_tender_columns(df: pd.DataFrame, cfg: Config) -> None:
         )
 
 
-def _cell(df: pd.DataFrame, idx, col: str) -> str:
-    if not col or col not in df.columns:
+def _cell(cols: dict[str, pd.Series], idx, col: str) -> str:
+    """Значение ячейки; cols — заранее вынутые колонки (так в разы быстрее)."""
+    if not col or col not in cols:
         return ""
-    value = str(_column(df, col).loc[idx]).strip()
+    value = str(cols[col].at[idx]).strip()
     return "" if value.lower() in {"nan", "none", "nat"} else value
 
 
@@ -122,10 +123,10 @@ def _group_ids(df: pd.DataFrame, cfg: Config) -> pd.Series:
     return pd.Series({idx: find(idx) for idx in df.index})
 
 
-def _client_key(df: pd.DataFrame, idx, cfg: Config) -> str:
+def _client_key(cols: dict[str, pd.Series], idx, cfg: Config) -> str:
     for col in cfg.tender_match_cols:
-        if col in df.columns:
-            key = _match_value(col, _column(df, col).loc[idx])
+        if col in cols:
+            key = _match_value(col, cols[col].at[idx])
             if key:
                 return key
     return str(idx)
@@ -169,33 +170,43 @@ def upcoming_tenders(
     cycle = pd.DateOffset(months=cfg.tender_cycle_months)
     fresh_gap = pd.Timedelta(days=cfg.tender_fresh_days)
 
+    # Считаем сразу по всей таблице (без перебора групп по одной — это было медленно).
+    # Прошлый тендер группы = строка с самой поздней датой приглашения.
+    with_invite = invite.dropna()
+    if with_invite.empty:
+        return []
+    base_rows = with_invite.groupby(groups.loc[with_invite.index]).idxmax()
+    last_invites = invite.loc[base_rows.values].set_axis(base_rows.index)
+    expected_all = last_invites + cycle
+    in_window = (expected_all >= pd.Timestamp(window_start)) & (expected_all <= pd.Timestamp(window_end))
+
+    # Уже есть запись о тендере этого года? Тогда напоминать не нужно.
+    latest_any = any_date.groupby(groups).max().reindex(last_invites.index)
+    already = (latest_any > last_invites + fresh_gap).fillna(False)
+
+    # Колонки для сообщения вынимаем из таблицы один раз, а не на каждую ячейку.
+    wanted = {
+        cfg.tender_col_name, cfg.tender_col_link, cfg.tender_col_setter,
+        *cfg.tender_info_cols, *cfg.tender_match_cols,
+    }
+    cols = {c: _column(df, c) for c in wanted if c and c in df.columns}
+
     result: list[UpcomingTender] = []
-    for _, members in groups.groupby(groups):
-        idxs = members.index
-        group_invites = invite.loc[idxs].dropna()
-        if group_invites.empty:
-            continue
-        base_idx = group_invites.idxmax()
-        last_invite: pd.Timestamp = group_invites.loc[base_idx]
-        expected = (last_invite + cycle).date()
-        if not (window_start <= expected <= window_end):
-            continue
-
-        # Уже есть запись о тендере этого года? Тогда напоминать не нужно.
-        if (any_date.loc[idxs] > last_invite + fresh_gap).any():
-            continue
-
+    for group in last_invites.index[in_window & ~already]:
+        base_idx = base_rows.loc[group]
+        last_invite: pd.Timestamp = last_invites.loc[group]
+        expected = expected_all.loc[group].date()
         info = tuple(
-            (col, _cell(df, base_idx, col))
+            (col, _cell(cols, base_idx, col))
             for col in cfg.tender_info_cols
-            if _cell(df, base_idx, col)
+            if _cell(cols, base_idx, col)
         )
         result.append(
             UpcomingTender(
-                key=_client_key(df, base_idx, cfg),
-                name=_cell(df, base_idx, cfg.tender_col_name),
-                link=_cell(df, base_idx, cfg.tender_col_link),
-                setter=_cell(df, base_idx, cfg.tender_col_setter),
+                key=_client_key(cols, base_idx, cfg),
+                name=_cell(cols, base_idx, cfg.tender_col_name),
+                link=_cell(cols, base_idx, cfg.tender_col_link),
+                setter=_cell(cols, base_idx, cfg.tender_col_setter),
                 last_invite=last_invite.date(),
                 expected=expected,
                 info=info,
@@ -204,6 +215,35 @@ def upcoming_tenders(
 
     result.sort(key=lambda t: (t.expected, t.name.lower()))
     return result
+
+
+_cache: dict = {}
+_cache_lock = threading.Lock()
+
+
+def upcoming_tenders_cached(cfg: Config, today: date, window: tuple[date, date] | None = None) -> list[UpcomingTender]:
+    """То же, что upcoming_tenders по снапшоту, но с запоминанием результата.
+
+    Пересчитываем, только если снапшот обновился (Apps Script шлёт его раз в
+    5 минут) или сменился день — иначе отвечаем сразу из памяти.
+    """
+    from sheets import fetch_dataframe
+
+    try:
+        mtime = os.path.getmtime(cfg.snapshot_path)
+    except OSError:
+        mtime = None
+    key = (mtime, today, window)
+    with _cache_lock:
+        if key in _cache:
+            return _cache[key]
+        df = fetch_dataframe(cfg, sheet=cfg.tenders_sheet)
+        result = upcoming_tenders(df, cfg, today=today, window=window)
+        # Держим только актуальное — старые снапшоты выкидываем.
+        for old in [k for k in _cache if k[0] != mtime or k[1] != today]:
+            del _cache[old]
+        _cache[key] = result
+        return result
 
 
 def tenders_for_setter(tenders: list[UpcomingTender], setter: str) -> list[UpcomingTender]:
