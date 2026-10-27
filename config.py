@@ -61,6 +61,25 @@ class Config:
 
     users_by_login: dict[str, User] = field(default_factory=dict)
 
+    # --- Прогноз повторных тендеров (лист со всеми сделками) ---
+    tenders_sheet: str = "Импорт"
+    # «Тот же тендер» = совпало название сделки (без регистра, знаков препинания и годов).
+    tender_match_cols: tuple[str, ...] = ("Название сделки",)
+    tender_col_invite: str = "Дата приглашения"
+    # Запасные даты для проверки «тендер этого года уже заведён», если нет даты приглашения.
+    tender_fallback_date_cols: tuple[str, ...] = ("Дата начала КП", "Дата окончания КП", "ДЛ")
+    tender_col_name: str = "Название сделки"
+    tender_col_link: str = "Ссылка"
+    tender_col_setter: str = "Ответственный"
+    tender_info_cols: tuple[str, ...] = (
+        "Тип тендера", "Сумма тендера", "Статус тендера (Этап)", "Предмет тендера",
+    )  # доп. инфо в сообщении
+    tender_cycle_months: int = 12  # через сколько ждём повторный тендер
+    tender_lead_months: int = 3  # за сколько предупреждать
+    tender_grace_days: int = 30  # сколько дней показывать «ожидался, но записи нет»
+    tender_fresh_days: int = 180  # запись позже прошлого тендера на N дней = тендер этого года
+    tender_notify_time: tuple[int, int] | None = None  # None = первое время из SEND_TIMES
+
     @property
     def snapshot_path(self) -> str:
         return os.path.join(self.data_dir, "snapshot.json")
@@ -186,5 +205,40 @@ def load_config() -> Config:
         send_when_empty=_bool("SEND_WHEN_EMPTY", False),
         data_dir=os.getenv("DATA_DIR", "data").strip() or "data",
         users_by_login={u.login: u for u in users},
+        **_tender_settings(),
     )
     return cfg
+
+
+# --- Прогноз повторных тендеров ---
+
+def _list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
+def _str(name: str, default: str) -> str:
+    return os.getenv(name, "").strip() or default
+
+
+def _tender_settings() -> dict:
+    """Настройки прогноза тендеров (по умолчанию — под лист «Импорт»)."""
+    notify_raw = os.getenv("TENDER_NOTIFY_TIME", "").strip()
+    return dict(
+        tenders_sheet=_str("TENDERS_SHEET", Config.tenders_sheet),
+        tender_match_cols=_list("TENDER_MATCH_COLS", Config.tender_match_cols)
+        or Config.tender_match_cols,
+        tender_col_invite=_str("TENDER_COL_INVITE", Config.tender_col_invite),
+        tender_fallback_date_cols=_list("TENDER_FALLBACK_DATE_COLS", Config.tender_fallback_date_cols),
+        tender_col_name=_str("TENDER_COL_NAME", Config.tender_col_name),
+        tender_col_link=_str("TENDER_COL_LINK", Config.tender_col_link),
+        tender_col_setter=_str("TENDER_COL_SETTER", Config.tender_col_setter),
+        tender_info_cols=_list("TENDER_INFO_COLS", Config.tender_info_cols),
+        tender_cycle_months=_int("TENDER_CYCLE_MONTHS", 12),
+        tender_lead_months=_int("TENDER_LEAD_MONTHS", 3),
+        tender_grace_days=_int("TENDER_GRACE_DAYS", 30),
+        tender_fresh_days=_int("TENDER_FRESH_DAYS", 180),
+        tender_notify_time=_parse_times(notify_raw)[0] if notify_raw else None,
+    )
