@@ -44,6 +44,13 @@ from sheets import (
     overdue_for_setter,
 )
 from storage import SubscriberStore
+from tenders import (
+    TenderNotifyStore,
+    UpcomingTender,
+    build_reminder_message,
+    build_upcoming_message,
+    upcoming_tenders,
+)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -55,6 +62,7 @@ BUTTON_MY_OVERDUE = "Мои просроченные"
 BUTTON_ALL_OVERDUE = "Все просроченные"
 BUTTON_MY_DECISION = "Мои решения"
 BUTTON_ALL_DECISION = "Все решения"
+BUTTON_TENDERS = "Ближайшие тендеры"
 MGR_PREFIX = "mgr:"
 MESSAGE_LIMIT = 4000
 
@@ -68,6 +76,7 @@ def _head_admin_keyboard() -> ReplyKeyboardMarkup:
         [
             [BUTTON_MY_OVERDUE, BUTTON_ALL_OVERDUE],
             [BUTTON_MY_DECISION, BUTTON_ALL_DECISION],
+            [BUTTON_TENDERS],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -291,6 +300,131 @@ async def on_all_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _reply_decision(update, context, user, mine=False)
 
 
+def _can_see_tenders(user: User | None) -> bool:
+    """Прогноз тендеров доступен только admin и head."""
+    return user is not None and (user.is_admin or user.is_head)
+
+
+async def on_tenders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «Ближайшие тендеры» (admin/head): все ожидаемые тендеры на ближайшие месяцы."""
+    cfg: Config = context.application.bot_data["cfg"]
+    store: SubscriberStore = context.application.bot_data["store"]
+    tg_user = update.effective_user
+    user = _user_by_username(cfg, tg_user.username if tg_user else None)
+    if not _can_see_tenders(user):
+        await update.message.reply_text("Доступ ограничен.")
+        return
+    store.set(user.login, update.effective_chat.id)
+
+    try:
+        df = fetch_dataframe(cfg, sheet=cfg.tenders_sheet)
+        tenders = upcoming_tenders(df, cfg)
+    except SnapshotNotReady as exc:
+        await update.message.reply_text(str(exc))
+        return
+    except Exception:
+        logger.exception("Ошибка прогноза тендеров для %s", user.login)
+        await update.message.reply_text("Не удалось загрузить данные о тендерах. Попробуйте позже.")
+        return
+
+    greeting = _greeting_for(user, tg_user.first_name if tg_user else None)
+    text = build_upcoming_message(greeting, tenders, cfg, show_setter=True)
+    await _send_html(context.bot, update.effective_chat.id, text, reply_markup=_keyboard_for(user))
+
+
+async def send_tender_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз в день: уведомляем о тендерах, которые впервые попали в окно 3 месяцев.
+
+    О каждом прогнозе уведомляем один раз (id хранится в data/tender_notified.json).
+    Если в выходные что-то попало в окно — уведомление придёт в понедельник.
+    Получают только admin и head.
+    """
+    cfg: Config = context.application.bot_data["cfg"]
+    store: SubscriberStore = context.application.bot_data["store"]
+    notified: TenderNotifyStore = context.application.bot_data["tender_notified"]
+
+    now = datetime.now(ZoneInfo(cfg.timezone))
+    if now.weekday() >= 5:
+        logger.info("Выходной день — напоминания о тендерах пропущены")
+        return
+
+    try:
+        df = fetch_dataframe(cfg, sheet=cfg.tenders_sheet)
+        tenders = upcoming_tenders(df, cfg, today=now.date())
+    except SnapshotNotReady:
+        logger.warning("Лист «%s» ещё не получен — напоминания о тендерах пропущены", cfg.tenders_sheet)
+        return
+    except Exception:
+        logger.exception("Не удалось построить прогноз тендеров")
+        return
+
+    fresh: list[UpcomingTender] = [t for t in tenders if not notified.is_notified(t.notify_id)]
+    if not fresh:
+        logger.info("Новых тендеров для напоминания нет")
+        return
+
+    text = build_reminder_message(fresh, cfg, show_setter=True, today=now.date())
+    sent = 0
+    for user in cfg.users:
+        # Напоминания получают только admin и head — обо всех тендерах.
+        if not _can_see_tenders(user):
+            continue
+        chat_id = store.get(user.login)
+        if chat_id is None:
+            continue
+        try:
+            await _send_html(context.bot, chat_id, text, reply_markup=_keyboard_for(user))
+            sent += 1
+        except Forbidden:
+            logger.warning("Пользователь %s заблокировал бота", user.login)
+        except TelegramError:
+            logger.exception("Ошибка отправки напоминания о тендерах пользователю %s", user.login)
+
+    notified.mark([t.notify_id for t in fresh], now.date())
+    logger.info("Напоминания о тендерах: %d новых прогнозов, отправлено %d сообщений", len(fresh), sent)
+
+
+async def on_sendusers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sendusers <текст> — admin рассылает сообщение всем подписанным пользователям."""
+    cfg: Config = context.application.bot_data["cfg"]
+    store: SubscriberStore = context.application.bot_data["store"]
+    tg_user = update.effective_user
+    user = _user_by_username(cfg, tg_user.username if tg_user else None)
+    if user is None or not user.is_admin:
+        await update.message.reply_text("Доступ ограничен.")
+        return
+
+    # Берём текст целиком после команды — с переносами строк и пробелами.
+    parts = (update.message.text or "").split(maxsplit=1)
+    text = parts[1].strip() if len(parts) > 1 else ""
+    if not text:
+        await update.message.reply_text("Напиши текст после команды, например:\n/sendusers Всем привет!")
+        return
+
+    sent, skipped, failed = 0, [], []
+    for u in cfg.users:
+        chat_id = store.get(u.login)
+        if chat_id is None:
+            skipped.append(u.login)
+            continue
+        try:
+            await context.bot.send_message(chat_id, text)
+            sent += 1
+        except Forbidden:
+            failed.append(f"{u.login} (заблокировал бота)")
+        except TelegramError:
+            logger.exception("/sendusers: ошибка отправки %s", u.login)
+            failed.append(u.login)
+
+    report = f"Отправлено: {sent} из {len(cfg.users)}."
+    if skipped:
+        report += "\nНе нажимали /start: " + ", ".join(f"@{x}" for x in skipped)
+    if failed:
+        report += "\nНе доставлено: " + ", ".join(failed)
+    logger.info("/sendusers от %s: отправлено %d", user.login, sent)
+    await update.message.reply_text(report)
+
+
 async def on_manager_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Админ нажал инлайн-кнопку менеджера — присылаем сделки этого менеджера."""
     cfg: Config = context.application.bot_data["cfg"]
@@ -411,6 +545,7 @@ def main() -> None:
     app = Application.builder().token(cfg.bot_token).build()
     app.bot_data["cfg"] = cfg
     app.bot_data["store"] = store
+    app.bot_data["tender_notified"] = TenderNotifyStore(cfg.data_dir)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("deals", on_my_overdue))
@@ -426,6 +561,11 @@ def main() -> None:
     app.add_handler(
         MessageHandler(filters.TEXT & filters.Regex(f"^{BUTTON_ALL_DECISION}$"), on_all_decision)
     )
+    app.add_handler(CommandHandler("tenders", on_tenders))
+    app.add_handler(CommandHandler("sendusers", on_sendusers))
+    app.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(f"^{BUTTON_TENDERS}$"), on_tenders)
+    )
     app.add_handler(CallbackQueryHandler(on_manager_button, pattern=rf"^{MGR_PREFIX}\d+$"))
 
     tz = ZoneInfo(cfg.timezone)
@@ -435,6 +575,13 @@ def main() -> None:
             time=time(hour=hour, minute=minute, tzinfo=tz),
             name=f"daily_{hour:02d}{minute:02d}",
         )
+
+    t_hour, t_minute = cfg.tender_notify_time or cfg.send_times[0]
+    app.job_queue.run_daily(
+        send_tender_reminders,
+        time=time(hour=t_hour, minute=t_minute, tzinfo=tz),
+        name="tender_reminders",
+    )
 
     admins = sum(1 for u in cfg.users if u.is_admin)
     logger.info(
