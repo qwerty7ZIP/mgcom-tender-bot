@@ -6,8 +6,10 @@
   сравнение без регистра, знаков препинания и годов (2025, 2026 …).
 - Берём последний тендер клиента с заполненной «Датой приглашения».
   Ожидаемая дата следующего = дата приглашения + TENDER_CYCLE_MONTHS (12).
-- Тендер попадает в «ближайшие», если ожидаемая дата в окне
-  [сегодня − TENDER_GRACE_DAYS; сегодня + TENDER_LEAD_MONTHS (3 мес.)].
+- Кнопка «Ближайшие тендеры»: ожидаемая дата = сегодня + 3 мес. ± неделя
+  (button_window).
+- Напоминание: ожидаемая дата = ровно сегодня + 3 мес., плюс дни, пропущенные
+  из-за выходных/простоя (reminder_window).
 - Если у клиента уже есть более свежая запись (дата приглашения или, если её
   нет, одна из запасных дат TENDER_FALLBACK_DATE_COLS позже прошлого тендера
   на TENDER_FRESH_DAYS) — тендер этого года уже заведён, напоминать не нужно.
@@ -137,6 +139,27 @@ def button_window(cfg: Config, today: date) -> tuple[date, date]:
     center = (pd.Timestamp(today) + pd.DateOffset(months=cfg.tender_lead_months)).date()
     spread = timedelta(days=cfg.tender_button_spread_days)
     return center - spread, center + spread
+
+
+REMINDER_MAX_CATCHUP_DAYS = 7  # сколько пропущенных дней максимум «добираем»
+
+
+def reminder_window(cfg: Config, today: date, last_run: date | None) -> tuple[date, date]:
+    """Окно напоминаний: тендеры, до которых РОВНО TENDER_LEAD_MONTHS (3 мес.).
+
+    Обычно это один день — сегодня + 3 мес. Если бот в прошлые дни не слал
+    напоминания (выходные, бот был выключен), окно расширяется назад до дня
+    после прошлой отправки (не больше чем на 7 дней), чтобы никого не пропустить.
+    Так же закрываются «дыры» месяцев: например, 01.03 + 3 мес. = 01.06, а
+    28.02 + 3 мес. = 28.05 — 29–31 мая попадут в рассылку 1 марта.
+    """
+    lead = pd.DateOffset(months=cfg.tender_lead_months)
+    target = (pd.Timestamp(today) + lead).date()
+    if last_run is None or last_run >= today:
+        return target, target
+    prev = max(last_run, today - timedelta(days=REMINDER_MAX_CATCHUP_DAYS))
+    start = (pd.Timestamp(prev) + lead).date() + timedelta(days=1)
+    return min(start, target), target
 
 
 def upcoming_tenders(
@@ -309,17 +332,16 @@ def build_upcoming_message(
 def build_reminder_message(
     tenders: list[UpcomingTender], cfg: Config, *, show_setter: bool, today: date | None = None
 ) -> str:
-    """Авто-уведомление о новых тендерах, которые попали в окно 3 месяцев."""
+    """Авто-уведомление о тендерах, до которых ровно TENDER_LEAD_MONTHS (3 мес.)."""
     if today is None:
         today = datetime.now(ZoneInfo(cfg.timezone)).date()
     blocks = [_tender_block(t, today, show_setter=show_setter) for t in tenders]
+    months = cfg.tender_lead_months
     head = (
-        "🔔 Скоро повторный тендер!\n"
-        f"Примерно через {cfg.tender_lead_months} мес. у клиента ожидается тендер "
+        f"🔔 Через {months} мес. ожидается повторный тендер\n"
         "(прошлый был год назад, записи о новом пока нет):"
         if len(tenders) == 1
-        else "🔔 Скоро повторные тендеры!\n"
-        f"Примерно в ближайшие {cfg.tender_lead_months} мес. ожидаются тендеры "
+        else f"🔔 Через {months} мес. ожидаются повторные тендеры\n"
         "(прошлые были год назад, записей о новых пока нет):"
     )
     return head + "\n\n" + "\n\n".join(blocks)
@@ -353,6 +375,23 @@ class TenderNotifyStore:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self._data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, self._path)
+
+    # День последней проверки напоминаний — чтобы после выходных/простоя
+    # добрать пропущенные дни (data/tender_last_run.txt).
+    def last_run(self) -> date | None:
+        path = os.path.join(os.path.dirname(self._path), "tender_last_run.txt")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return date.fromisoformat(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    def set_last_run(self, day: date) -> None:
+        path = os.path.join(os.path.dirname(self._path), "tender_last_run.txt")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(day.isoformat())
+        os.replace(tmp, path)
 
     def is_notified(self, notify_id: str) -> bool:
         return notify_id in self._data

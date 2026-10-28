@@ -52,6 +52,7 @@ from tenders import (
     build_reminder_message,
     build_upcoming_message,
     button_window,
+    reminder_window,
     upcoming_tenders,
     upcoming_tenders_cached,
 )
@@ -357,10 +358,11 @@ async def warm_tenders_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def send_tender_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Раз в день: уведомляем о тендерах, которые впервые попали в окно 3 месяцев.
+    """Раз в будний день: тендеры, до ожидаемой даты которых ровно 3 месяца.
 
+    Обычно это 1–2 тендера. Дни, пропущенные из-за выходных или простоя бота,
+    добираются при следующей отправке (не больше 7 дней назад).
     О каждом прогнозе уведомляем один раз (id хранится в data/tender_notified.json).
-    Если в выходные что-то попало в окно — уведомление придёт в понедельник.
     Получают только admin и head.
     """
     cfg: Config = context.application.bot_data["cfg"]
@@ -374,7 +376,8 @@ async def send_tender_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         df = fetch_dataframe(cfg, sheet=cfg.tenders_sheet)
-        tenders = upcoming_tenders(df, cfg, today=now.date())
+        window = reminder_window(cfg, now.date(), notified.last_run())
+        tenders = upcoming_tenders(df, cfg, today=now.date(), window=window)
     except SnapshotNotReady:
         logger.warning("Лист «%s» ещё не получен — напоминания о тендерах пропущены", cfg.tenders_sheet)
         return
@@ -384,7 +387,8 @@ async def send_tender_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     fresh: list[UpcomingTender] = [t for t in tenders if not notified.is_notified(t.notify_id)]
     if not fresh:
-        logger.info("Новых тендеров для напоминания нет")
+        notified.set_last_run(now.date())
+        logger.info("Тендеров ровно через 3 мес. нет (окно %s — %s)", *window)
         return
 
     text = build_reminder_message(fresh, cfg, show_setter=True, today=now.date())
@@ -405,7 +409,11 @@ async def send_tender_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.exception("Ошибка отправки напоминания о тендерах пользователю %s", user.login)
 
     notified.mark([t.notify_id for t in fresh], now.date())
-    logger.info("Напоминания о тендерах: %d новых прогнозов, отправлено %d сообщений", len(fresh), sent)
+    notified.set_last_run(now.date())
+    logger.info(
+        "Напоминания о тендерах (окно %s — %s): %d тендеров, отправлено %d сообщений",
+        window[0], window[1], len(fresh), sent,
+    )
 
 
 async def on_sendusers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
