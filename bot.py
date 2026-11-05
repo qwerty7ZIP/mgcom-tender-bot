@@ -370,6 +370,12 @@ async def send_tender_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     notified: TenderNotifyStore = context.application.bot_data["tender_notified"]
 
     now = datetime.now(ZoneInfo(cfg.timezone))
+    if not notified.reminders_enabled():
+        # Выключено через /future_off. Отмечаем день как пройденный, чтобы
+        # после /future_on не пришла пачка тендеров за время выключения.
+        notified.set_last_run(now.date())
+        logger.info("Напоминания о тендерах выключены (/future_off)")
+        return
     if now.weekday() >= 5:
         logger.info("Выходной день — напоминания о тендерах пропущены")
         return
@@ -414,6 +420,44 @@ async def send_tender_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
         "Напоминания о тендерах (окно %s — %s): %d тендеров, отправлено %d сообщений",
         window[0], window[1], len(fresh), sent,
     )
+
+
+async def _set_future(update: Update, context: ContextTypes.DEFAULT_TYPE, enabled: bool) -> None:
+    """/future_on, /future_off (admin): включить/выключить ежедневные напоминания о тендерах."""
+    cfg: Config = context.application.bot_data["cfg"]
+    notified: TenderNotifyStore = context.application.bot_data["tender_notified"]
+    tg_user = update.effective_user
+    user = _user_by_username(cfg, tg_user.username if tg_user else None)
+    if user is None or not user.is_admin:
+        await update.message.reply_text("Доступ ограничен.")
+        return
+
+    was = notified.reminders_enabled()
+    notified.set_reminders_enabled(enabled)
+    logger.info("%s: напоминания о тендерах %s", user.login, "включены" if enabled else "выключены")
+    if enabled:
+        text = (
+            "Ежедневные напоминания о тендерах уже были включены."
+            if was else
+            "✅ Ежедневные напоминания о тендерах включены. Ближайшее придёт в будний день "
+            "по расписанию — о тендерах, до которых ровно 3 месяца."
+        )
+    else:
+        text = (
+            "Ежедневные напоминания о тендерах уже были выключены."
+            if not was else
+            "⏸ Ежедневные напоминания о тендерах выключены. "
+            "Кнопка «Ближайшие тендеры» продолжает работать. Включить: /future_on"
+        )
+    await update.message.reply_text(text)
+
+
+async def on_future_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_future(update, context, True)
+
+
+async def on_future_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_future(update, context, False)
 
 
 async def on_sendusers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -595,6 +639,8 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("tenders", on_tenders))
     app.add_handler(CommandHandler("sendusers", on_sendusers))
+    app.add_handler(CommandHandler("future_on", on_future_on))
+    app.add_handler(CommandHandler("future_off", on_future_off))
     app.add_handler(
         MessageHandler(filters.TEXT & filters.Regex(f"^{BUTTON_TENDERS}$"), on_tenders)
     )

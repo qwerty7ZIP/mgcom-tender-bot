@@ -393,6 +393,23 @@ class TenderNotifyStore:
             f.write(day.isoformat())
         os.replace(tmp, path)
 
+    # Включены ли ежедневные напоминания (/future_on, /future_off).
+    # Хранится в data/tender_reminders.json, по умолчанию — включены.
+    def reminders_enabled(self) -> bool:
+        path = os.path.join(os.path.dirname(self._path), "tender_reminders.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return bool(json.load(f).get("enabled", True))
+        except (OSError, ValueError, AttributeError):
+            return True
+
+    def set_reminders_enabled(self, enabled: bool) -> None:
+        path = os.path.join(os.path.dirname(self._path), "tender_reminders.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"enabled": enabled}, f)
+        os.replace(tmp, path)
+
     def is_notified(self, notify_id: str) -> bool:
         return notify_id in self._data
 
